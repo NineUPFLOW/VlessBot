@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force run (ignore cache)'
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -45,6 +50,7 @@ jobs:
           PY
 
       - name: Restore state
+        if: ${{ github.event.inputs.force != 'true' }}
         uses: actions/cache/restore@v4
         with:
           key: vless-state-${{ github.ref_name }}-${{ github.run_number }}
