@@ -1,4 +1,4 @@
-"""Оформление сообщений о VLESS-ключах. Только правда: никаких «белых IP»."""
+"""Оформление сообщений о VLESS-ключах. Только информация о ключе."""
 from __future__ import annotations
 
 import html
@@ -31,8 +31,12 @@ def _vless_kind(p: dict) -> str:
 
 def _transport(p: dict) -> str:
     return {
-        "tcp": "TCP", "raw": "RAW", "ws": "WebSocket",
-        "grpc": "gRPC", "http": "HTTP/2", "xhttp": "XHTTP",
+        "tcp": "TCP",
+        "raw": "RAW",
+        "ws": "WebSocket",
+        "grpc": "gRPC",
+        "http": "HTTP/2",
+        "xhttp": "XHTTP",
     }.get((p.get("type") or "tcp").lower(), (p.get("type") or "tcp").upper())
 
 
@@ -43,19 +47,18 @@ def _tls_marker(p: dict) -> str:
 
 
 def _mask_label(p: dict) -> str:
-    """Под какой домен маскируется VLESS + статус SNI-домена.
-    ✅ = SNI-домен отвечает из US-раннера (не значит что не заблокирован в РФ)
-    ⚠️ = SNI-домен не отвечает."""
+    """Под какой домен маскируется VLESS + статус SNI-домена."""
     sni = p.get("sni") or "—"
     sec = (p.get("security") or "").lower()
     sni_alive = p.get("probe_resistant", False)
     sni_status = "🟢" if sni_alive else "🔴"
+    safe_sni = html.escape(_trunc(sni, 36))
 
     if sec == "reality":
-        return f"🎭 Reality → {html.escape(_trunc(sni, 36))} {sni_status}"
+        return f"🎭 Reality → {safe_sni} {sni_status}"
     if sec == "tls":
-        return f"🔐 SNI → {html.escape(_trunc(sni, 36))} {sni_status}"
-    return f"🎭 SNI → {html.escape(_trunc(sni, 36))} {sni_status}"
+        return f"🔐 SNI → {safe_sni} {sni_status}"
+    return f"🎭 SNI → {safe_sni} {sni_status}"
 
 
 def format_message(p: dict) -> str:
@@ -65,7 +68,6 @@ def format_message(p: dict) -> str:
     flag = p.get("flag") or "🌐"
     country = _trunc(p.get("country") or "Unknown", 30)
 
-    # Шапка — без «БЕЛЫЙ IP» (это былa ложь)
     header = f"🚀 #{pid} | {flag} {country}"
 
     kind = _vless_kind(p)
@@ -76,7 +78,9 @@ def format_message(p: dict) -> str:
     tls_marker = _tls_marker(p)
     mask = _mask_label(p)
 
-    raw = p.get("raw", "")
+    raw = p.get("raw", "").strip()
+    if not raw:
+        raw = "—"
 
     lines = [
         html.escape(header),
