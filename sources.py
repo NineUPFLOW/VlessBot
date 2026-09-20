@@ -1,12 +1,21 @@
-"""Сбор VLESS-ссылок из Telegram-каналов через Telethon userbot."""
+"""
+Сбор VLESS-ключей.
+
+Два канала:
+1. GitHub-подписки (raw .txt) — быстро, без Telethon, без риска бана
+2. Telegram-каналы через Telethon — из текста, code-блоков, inline-кнопок,
+   подписей к медиа, тем (Topics)
+"""
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
 from urllib.parse import parse_qs, unquote, urlparse
 
+import aiohttp
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
@@ -17,18 +26,26 @@ from telethon.tl.types import (
     MessageMediaWebPage,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# ~22 источника (без @)
-TELEGRAM_SOURCES: list[str] = [
-    "RaViraNet",
+# ─── 1. GitHub-подписки (обновляются внешними проектами) ──────────────
+SUBSCRIPTION_URLS: list[str] = [
+    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
+    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt",
+    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/vless.txt",
+    "https://raw.githubusercontent.com/free-nodes/v2rayfree/main/v202602242",
+]
+
+# ─── 2. Telegram-каналы (парсинг через Telethon) ──────────────────────
+TELEGRAM_CHANNELS: list[str] = [
+    "Outline_Vless_Vpn",
     "vless_configs",
+    "vlessfree",
     "free_vless",
     "vless_list",
-    "vlessfree",
-    "v2ray_configs_pool",
-    "proxy_mtp_ru",
-    "vless_v2ray_iran",
     "configs_vless",
     "vless_iran_free",
     "v2rayng_config",
@@ -43,6 +60,9 @@ TELEGRAM_SOURCES: list[str] = [
     "free_configs_vless",
     "v2ray_vless_free",
     "vless_public_free",
+    "Notorgames",
+    "dbproxy",
+    "Beshkan",
 ]
 
 RE_VLESS = re.compile(r"vless://[^\s<>\"'\)\]]+")
@@ -50,6 +70,7 @@ RE_MARKDOWN = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 RE_HTML_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
 
+# ─── Парсинг одной VLESS-ссылки ───────────────────────────────────────
 def _parse_vless(line: str) -> dict | None:
     line = line.strip()
     if not line.startswith("vless://"):
@@ -64,8 +85,11 @@ def _parse_vless(line: str) -> dict | None:
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         name = unquote(parsed.fragment) if parsed.fragment else ""
         security = (params.get("security") or "").lower()
+
+        # ФИЛЬТР: только Reality/TLS. Без маскировки VLESS бесполезен.
         if security not in ("reality", "tls"):
             return None
+
         return {
             "protocol": "VLESS",
             "uuid": uuid,
@@ -81,8 +105,8 @@ def _parse_vless(line: str) -> dict | None:
             "raw": line,
             "name": name,
         }
-    except Exception as e:  # noqa: BLE001
-        log.debug("vless parse error: %s (%s)", e, line[:80])
+    except Exception as e:
+        logger.debug("vless parse error: %s (%s)", e, line[:80])
         return None
 
 
@@ -90,7 +114,7 @@ def _extract_vless_from_text(text: str) -> list[str]:
     if not text:
         return []
     found: list[str] = []
-    for _text, url in RE_MARKDOWN.findall(text):
+    for _t, url in RE_MARKDOWN.findall(text):
         if url.startswith("vless://"):
             found.append(url)
     for url in RE_HTML_HREF.findall(text):
@@ -100,16 +124,16 @@ def _extract_vless_from_text(text: str) -> list[str]:
     return found
 
 
+# ─── Парсинг сообщения Telethon ───────────────────────────────────────
 def _extract_from_message(msg) -> list[str]:
     found: list[str] = []
     text = getattr(msg, "message", None) or ""
     if text:
         found.extend(_extract_vless_from_text(text))
-
         entities = getattr(msg, "entities", None) or []
         for ent in entities:
             if isinstance(ent, (MessageEntityCode, MessageEntityPre)):
-                snippet = text[ent.offset : ent.offset + ent.length]
+                snippet = text[ent.offset:ent.offset + ent.length]
                 found.extend(_extract_vless_from_text(snippet))
 
     reply_markup = getattr(msg, "reply_markup", None)
@@ -120,7 +144,7 @@ def _extract_from_message(msg) -> list[str]:
                     url = getattr(button, "url", None)
                     if url and url.startswith("vless://"):
                         found.append(url)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     media = getattr(msg, "media", None)
@@ -134,20 +158,78 @@ def _extract_from_message(msg) -> list[str]:
     return found
 
 
+# ─── GitHub-подписки ──────────────────────────────────────────────────
+def _try_base64_decode(text: str) -> str:
+    stripped = "".join(text.split())
+    if len(stripped) < 32:
+        return text
+    try:
+        decoded = base64.b64decode(stripped + "=" * (-len(stripped) % 4)).decode(
+            "utf-8", errors="ignore"
+        )
+        if "vless://" in decoded:
+            return decoded
+    except Exception:
+        pass
+    return text
+
+
+async def _fetch_subscription(session: aiohttp.ClientSession, url: str) -> list[dict]:
+    results: list[dict] = []
+    try:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("Sub %s → HTTP %d", url, resp.status)
+                return []
+            text = await resp.text()
+    except Exception as e:
+        logger.warning("Sub %s failed: %s", url, e)
+        return []
+
+    text = _try_base64_decode(text)
+    for raw in RE_VLESS.findall(text):
+        p = _parse_vless(raw)
+        if p:
+            p["source"] = url.rsplit("/", 1)[-1]
+            results.append(p)
+
+    logger.info("Sub %s → %d VLESS", url.rsplit("/", 1)[-1], len(results))
+    return results
+
+
+async def fetch_from_subscriptions() -> list[dict]:
+    connector = aiohttp.TCPConnector(limit=8, ssl=False)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as session:
+        tasks = [_fetch_subscription(session, url) for url in SUBSCRIPTION_URLS]
+        chunks = await asyncio.gather(*tasks, return_exceptions=True)
+
+    out: list[dict] = []
+    for c in chunks:
+        if isinstance(c, list):
+            out.extend(c)
+    logger.info("Из подписок: %d VLESS", len(out))
+    return out
+
+
+# ─── Telegram через Telethon ──────────────────────────────────────────
 async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
     results: list[dict] = []
     try:
         try:
             await client(JoinChannelRequest(source))
-        except Exception:  # noqa: BLE001
-            pass  # уже подписаны / приватный / и т.п.
+        except Exception:
+            pass
 
         entity = await client.get_entity(source)
-
         message_count = 0
         thread_ids: set[int] = set()
 
-        async for msg in client.iter_messages(entity, limit=200):
+        async for msg in client.iter_messages(entity, limit=150):
             message_count += 1
             reply_to = getattr(msg, "reply_to", None)
             top_id = getattr(reply_to, "reply_to_top_id", None) if reply_to else None
@@ -162,61 +244,67 @@ async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
         for tid in list(thread_ids)[:5]:
             try:
                 async for msg in client.iter_messages(
-                    entity, limit=50, reply_to=tid
+                    entity, limit=40, reply_to=tid
                 ):
                     for raw in _extract_from_message(msg):
                         parsed = _parse_vless(raw)
                         if parsed:
                             parsed["source"] = source
                             results.append(parsed)
-            except Exception as e:  # noqa: BLE001
-                log.debug("thread read error @%s/%s: %s", source, tid, e)
+            except Exception as e:
+                logger.debug("thread @%s/%s: %s", source, tid, e)
 
-        log.info(
-            "Telegram @%s: %d сообщений, %d тем → %d VLESS",
-            source,
-            message_count,
-            len(thread_ids),
-            len(results),
+        logger.info(
+            "TG @%s: %d сообщений, %d тем → %d VLESS",
+            source, message_count, len(thread_ids), len(results),
         )
     except FloodWaitError as e:
-        wait = min(e.seconds, 60)
-        log.warning("FloodWait @%s: %ds", source, e.seconds)
-        await asyncio.sleep(wait)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Source @%s failed: %s", source, e)
+        await asyncio.sleep(min(e.seconds, 60))
+    except Exception as e:
+        logger.warning("Source @%s failed: %s", source, e)
 
     return results
 
 
-async def fetch_all_vless() -> list[dict]:
+async def fetch_from_telegram(channels: list[str]) -> list[dict]:
     api_id_raw = os.environ.get("API_ID", "").strip()
     api_hash = os.environ.get("API_HASH", "").strip()
     session_str = os.environ.get("TG_SESSION", "").strip()
     if not (api_id_raw and api_hash and session_str):
-        log.error("API_ID / API_HASH / TG_SESSION не заданы")
+        logger.warning("Telegram-источники пропущены: нет API_ID/API_HASH/TG_SESSION")
         return []
     try:
         api_id = int(api_id_raw)
     except ValueError:
-        log.error("API_ID не число")
         return []
 
     client = TelegramClient(StringSession(session_str), api_id, api_hash)
     all_items: list[dict] = []
     try:
         await client.start()
-        for src in TELEGRAM_SOURCES:
+        for src in channels:
             items = await _fetch_from_source(client, src)
             all_items.extend(items)
             await asyncio.sleep(2)
     finally:
         try:
             await client.disconnect()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
-    # дедуп по (uuid, ip, port)
+    logger.info("Из Telegram: %d VLESS", len(all_items))
+    return all_items
+
+
+# ─── PUBLIC API ───────────────────────────────────────────────────────
+async def fetch_all_vless() -> list[dict]:
+    sub_task = asyncio.create_task(fetch_from_subscriptions())
+    tg_task = asyncio.create_task(fetch_from_telegram(TELEGRAM_CHANNELS))
+
+    sub_items, tg_items = await asyncio.gather(sub_task, tg_task)
+    all_items = sub_items + tg_items
+
+    # Дедуп по (uuid, ip, port)
     seen: set[tuple] = set()
     unique: list[dict] = []
     for it in all_items:
@@ -226,5 +314,8 @@ async def fetch_all_vless() -> list[dict]:
         seen.add(key)
         unique.append(it)
 
-    log.info("Всего VLESS из Telegram: %d (уникальных)", len(unique))
+    logger.info(
+        "Итог: подписки=%d, telegram=%d, уникальных=%d",
+        len(sub_items), len(tg_items), len(unique),
+    )
     return unique
