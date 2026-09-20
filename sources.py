@@ -21,14 +21,13 @@ from telethon.tl.types import (
 
 logger = logging.getLogger(__name__)
 
-MAX_PER_SUB = 10000
+MAX_PER_SUB = 5000
 
 SUBSCRIPTION_URLS: list[str] = [
     "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
     "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
     "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",
-    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt",
 ]
 
 TELEGRAM_CHANNELS: list[str] = [
@@ -36,16 +35,24 @@ TELEGRAM_CHANNELS: list[str] = [
     "Beshkan",
     "v2ray_vless_free",
     "free_vless",
-    "v2ray_configs_pool",
-    "Custom_V2ray_Config",
-    "V2rayOutfit",
-    "npv2ray",
-    "vlessiran_free",
 ]
 
 RE_VLESS = re.compile(r"vless://[^\s<>\"'\)\]]+")
 RE_MARKDOWN = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 RE_HTML_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _source_tag(url: str) -> str:
+    """Уникальный тег вида owner/repo:filename."""
+    try:
+        parts = url.rstrip("/").split("/")
+        # .../owner/repo/branch/path/file
+        owner = parts[-4]
+        repo = parts[-3]
+        filename = parts[-1]
+        return f"{owner}/{repo}:{filename}"
+    except Exception:
+        return url.rsplit("/", 1)[-1]
 
 
 def _parse_vless(line: str) -> dict | None:
@@ -148,29 +155,29 @@ def _try_base64_decode(text: str) -> str:
 
 async def _fetch_subscription(session: aiohttp.ClientSession, url: str) -> list[dict]:
     results: list[dict] = []
+    tag = _source_tag(url)
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
-                logger.warning("Sub %s → HTTP %d", url, resp.status)
+                logger.warning("Sub %s → HTTP %d", tag, resp.status)
                 return []
             text = await resp.text()
     except Exception as e:
-        logger.warning("Sub %s failed: %s", url, e)
+        logger.warning("Sub %s failed: %s", tag, e)
         return []
 
     text = _try_base64_decode(text)
-    source_tag = url.rsplit("/", 1)[-1]
 
     for raw in RE_VLESS.findall(text):
         p = _parse_vless(raw)
         if p:
-            p["source"] = source_tag
+            p["source"] = tag
             results.append(p)
             if len(results) >= MAX_PER_SUB:
-                logger.info("Sub %s — обрезано на %d", source_tag, MAX_PER_SUB)
+                logger.info("Sub %s — обрезано на %d", tag, MAX_PER_SUB)
                 break
 
-    logger.info("Sub %s → %d VLESS", source_tag, len(results))
+    logger.info("Sub %s → %d VLESS", tag, len(results))
     return results
 
 
