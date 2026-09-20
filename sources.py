@@ -1,11 +1,4 @@
-"""
-Сбор VLESS-ключей.
-
-Два канала:
-1. GitHub-подписки (raw .txt) — быстро, без Telethon, без риска бана
-2. Telegram-каналы через Telethon — из текста, code-блоков, inline-кнопок,
-   подписей к медиа, тем (Topics)
-"""
+"""Сбор VLESS-ключей. Только живые источники."""
 from __future__ import annotations
 
 import asyncio
@@ -28,41 +21,33 @@ from telethon.tl.types import (
 
 logger = logging.getLogger(__name__)
 
-# ─── 1. GitHub-подписки (обновляются внешними проектами) ──────────────
+# Лимит ключей с одной подписки (SoliSpirit отдаёт 280k мусора)
+MAX_PER_SUB = 10000
+
+# ─── GitHub-подписки (только живые по логу) ──────────────────────────
 SUBSCRIPTION_URLS: list[str] = [
-    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
-    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",
-    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
-    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",
+    # Проверены в последнем запуске:
+    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",         # 223
+    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",         # 89
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",  # 3892
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",  # 4407
+    # Ограничено 10k, иначе 282k мусора:
     "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/list/vless.txt",
-    "https://raw.githubusercontent.com/free-nodes/v2rayfree/main/v202602242",
 ]
 
-# ─── 2. Telegram-каналы (парсинг через Telethon) ──────────────────────
+# ─── Telegram-каналы ─────────────────────────────────────────────────
 TELEGRAM_CHANNELS: list[str] = [
-    "Outline_Vless_Vpn",
-    "vless_configs",
-    "vlessfree",
-    "free_vless",
-    "vless_list",
-    "configs_vless",
-    "vless_iran_free",
-    "v2rayng_config",
-    "vless_shadow",
-    "free_v2ray_configs",
-    "proxy_vless_free",
-    "vless_iran_plus",
-    "vless_keys",
-    "configs_free_vless",
-    "vless_tunnel",
-    "vless_shop_free",
-    "free_configs_vless",
-    "v2ray_vless_free",
-    "vless_public_free",
-    "Notorgames",
-    "dbproxy",
-    "Beshkan",
+    # Проверены в логе — живые:
+    "dbproxy",              # 199 VLESS
+    "Beshkan",              # 31
+    "v2ray_vless_free",     # 12
+    "free_vless",           # 6
+    # Известные живые (проверятся при запуске):
+    "v2ray_configs_pool",
+    "Custom_V2ray_Config",
+    "V2rayOutfit",
+    "npv2ray",
+    "vlessiran_free",
 ]
 
 RE_VLESS = re.compile(r"vless://[^\s<>\"'\)\]]+")
@@ -70,7 +55,6 @@ RE_MARKDOWN = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 RE_HTML_HREF = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
 
 
-# ─── Парсинг одной VLESS-ссылки ───────────────────────────────────────
 def _parse_vless(line: str) -> dict | None:
     line = line.strip()
     if not line.startswith("vless://"):
@@ -85,11 +69,8 @@ def _parse_vless(line: str) -> dict | None:
         params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         name = unquote(parsed.fragment) if parsed.fragment else ""
         security = (params.get("security") or "").lower()
-
-        # ФИЛЬТР: только Reality/TLS. Без маскировки VLESS бесполезен.
         if security not in ("reality", "tls"):
             return None
-
         return {
             "protocol": "VLESS",
             "uuid": uuid,
@@ -124,7 +105,6 @@ def _extract_vless_from_text(text: str) -> list[str]:
     return found
 
 
-# ─── Парсинг сообщения Telethon ───────────────────────────────────────
 def _extract_from_message(msg) -> list[str]:
     found: list[str] = []
     text = getattr(msg, "message", None) or ""
@@ -158,7 +138,7 @@ def _extract_from_message(msg) -> list[str]:
     return found
 
 
-# ─── GitHub-подписки ──────────────────────────────────────────────────
+# ─── GitHub-подписки ─────────────────────────────────────────────────
 def _try_base64_decode(text: str) -> str:
     stripped = "".join(text.split())
     if len(stripped) < 32:
@@ -177,9 +157,7 @@ def _try_base64_decode(text: str) -> str:
 async def _fetch_subscription(session: aiohttp.ClientSession, url: str) -> list[dict]:
     results: list[dict] = []
     try:
-        async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
                 logger.warning("Sub %s → HTTP %d", url, resp.status)
                 return []
@@ -189,21 +167,25 @@ async def _fetch_subscription(session: aiohttp.ClientSession, url: str) -> list[
         return []
 
     text = _try_base64_decode(text)
+    source_tag = url.rsplit("/", 1)[-1]
+
     for raw in RE_VLESS.findall(text):
         p = _parse_vless(raw)
         if p:
-            p["source"] = url.rsplit("/", 1)[-1]
+            p["source"] = source_tag
             results.append(p)
+            if len(results) >= MAX_PER_SUB:
+                logger.info("Sub %s — обрезано на %d", source_tag, MAX_PER_SUB)
+                break
 
-    logger.info("Sub %s → %d VLESS", url.rsplit("/", 1)[-1], len(results))
+    logger.info("Sub %s → %d VLESS", source_tag, len(results))
     return results
 
 
 async def fetch_from_subscriptions() -> list[dict]:
     connector = aiohttp.TCPConnector(limit=8, ssl=False)
     async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=aiohttp.ClientTimeout(total=30),
+        connector=connector, timeout=aiohttp.ClientTimeout(total=30)
     ) as session:
         tasks = [_fetch_subscription(session, url) for url in SUBSCRIPTION_URLS]
         chunks = await asyncio.gather(*tasks, return_exceptions=True)
@@ -216,7 +198,7 @@ async def fetch_from_subscriptions() -> list[dict]:
     return out
 
 
-# ─── Telegram через Telethon ──────────────────────────────────────────
+# ─── Telegram ────────────────────────────────────────────────────────
 async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
     results: list[dict] = []
     try:
@@ -243,9 +225,7 @@ async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
 
         for tid in list(thread_ids)[:5]:
             try:
-                async for msg in client.iter_messages(
-                    entity, limit=40, reply_to=tid
-                ):
+                async for msg in client.iter_messages(entity, limit=40, reply_to=tid):
                     for raw in _extract_from_message(msg):
                         parsed = _parse_vless(raw)
                         if parsed:
@@ -271,7 +251,7 @@ async def fetch_from_telegram(channels: list[str]) -> list[dict]:
     api_hash = os.environ.get("API_HASH", "").strip()
     session_str = os.environ.get("TG_SESSION", "").strip()
     if not (api_id_raw and api_hash and session_str):
-        logger.warning("Telegram-источники пропущены: нет API_ID/API_HASH/TG_SESSION")
+        logger.warning("Telegram пропущен: нет API_ID/API_HASH/TG_SESSION")
         return []
     try:
         api_id = int(api_id_raw)
@@ -296,7 +276,7 @@ async def fetch_from_telegram(channels: list[str]) -> list[dict]:
     return all_items
 
 
-# ─── PUBLIC API ───────────────────────────────────────────────────────
+# ─── PUBLIC API ──────────────────────────────────────────────────────
 async def fetch_all_vless() -> list[dict]:
     sub_task = asyncio.create_task(fetch_from_subscriptions())
     tg_task = asyncio.create_task(fetch_from_telegram(TELEGRAM_CHANNELS))
@@ -304,7 +284,6 @@ async def fetch_all_vless() -> list[dict]:
     sub_items, tg_items = await asyncio.gather(sub_task, tg_task)
     all_items = sub_items + tg_items
 
-    # Дедуп по (uuid, ip, port)
     seen: set[tuple] = set()
     unique: list[dict] = []
     for it in all_items:
