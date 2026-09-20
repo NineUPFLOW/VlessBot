@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections import defaultdict, deque
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -21,6 +22,7 @@ SEND_DELAY = 3
 MAX_SEND_RETRIES = 3
 CONCURRENCY = 20
 MAX_VLESS_CHECK = 500
+PER_SOURCE_LIMIT = 80   # сколько максимум брать из одного источника
 
 
 def _setup_logging() -> None:
@@ -52,7 +54,7 @@ async def send_status(bot: Bot, text: str) -> None:
     try:
         await bot.send_message(**kwargs)
     except TelegramAPIError as e:
-        log.warning("send_status failed: %s", e)
+        log.warning("send_status: %s", e)
 
 
 async def check_with_semaphore(sem: asyncio.Semaphore, raw: dict) -> dict | None:
@@ -76,8 +78,43 @@ async def check_group(raws: list[dict]) -> list[dict]:
     return [r for r in results if r is not None]
 
 
+def _dedup_by_address(keys: list[dict]) -> list[dict]:
+    """Дедуп по (ip, port). Один сервер = одна запись."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for k in keys:
+        addr = (k.get("ip"), k.get("port"))
+        if addr in seen:
+            continue
+        seen.add(addr)
+        out.append(k)
+    return out
+
+
+def _balance_by_source(keys: list[dict], total_limit: int) -> list[dict]:
+    """Берём по PER_SOURCE_LIMIT из каждого источника, круговым обходом."""
+    by_source: dict[str, deque] = defaultdict(deque)
+    for k in keys:
+        by_source[k.get("source", "unknown")].append(k)
+
+    result: list[dict] = []
+    while len(result) < total_limit and by_source:
+        for src in list(by_source.keys()):
+            if not by_source[src]:
+                del by_source[src]
+                continue
+            # Не больше PER_SOURCE_LIMIT из одного источника
+            src_taken = sum(1 for r in result if r.get("source") == src)
+            if src_taken >= PER_SOURCE_LIMIT:
+                del by_source[src]
+                continue
+            result.append(by_source[src].popleft())
+            if len(result) >= total_limit:
+                break
+    return result
+
+
 def sort_key(key: dict):
-    """Приоритет: Reality+PROBE → Reality → XTLS-Vision → остальные."""
     probe = bool(key.get("probe_resistant"))
     reality = (key.get("security") or "").lower() == "reality"
     vision = (key.get("flow") or "") == "xtls-rprx-vision"
@@ -94,9 +131,7 @@ def sort_key(key: dict):
     return (group, ping)
 
 
-async def send_with_retry(
-    bot: Bot, chat_id: int, text: str, thread_id: int | None
-) -> bool:
+async def send_with_retry(bot: Bot, chat_id: int, text: str, thread_id: int | None) -> bool:
     kwargs: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -127,22 +162,35 @@ async def run(bot: Bot) -> None:
         await send_status(bot, "⚠️ Источники пусты")
         return
 
-    # Дедуп по (uuid, ip, port)
-    seen_keys: set[tuple] = set()
+    # Дедуп #1: по (uuid, ip, port)
+    seen1: set[tuple] = set()
     deduped: list[dict] = []
     for r in raws:
         k = (r.get("uuid"), r.get("ip"), r.get("port"))
-        if k in seen_keys:
+        if k in seen1:
             continue
-        seen_keys.add(k)
+        seen1.add(k)
         deduped.append(r)
+    log.info("После дедупа по (uuid,ip,port): %d", len(deduped))
 
-    log.info("Уникальных VLESS: %d", len(deduped))
+    # Дедуп #2: по (ip, port) — один сервер = одна запись
+    deduped = _dedup_by_address(deduped)
+    log.info("После дедупа по (ip,port): %d", len(deduped))
 
     unseen = state.filter_unseen(deduped)
     log.info("Не видели ранее: %d", len(unseen))
 
-    to_check = unseen[:MAX_VLESS_CHECK]
+    # Балансировка по источникам
+    to_check = _balance_by_source(unseen, MAX_VLESS_CHECK)
+
+    # Диагностика: сколько из какого источника
+    src_counts: dict[str, int] = defaultdict(int)
+    for k in to_check:
+        src_counts[k.get("source", "unknown")] += 1
+    log.info("Выборка по источникам (топ-15):")
+    for src, n in sorted(src_counts.items(), key=lambda x: -x[1])[:15]:
+        log.info("  %s: %d", src, n)
+
     log.info("Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
              len(to_check), CONCURRENCY, checker.MAX_PING_MS)
 
@@ -153,9 +201,9 @@ async def run(bot: Bot) -> None:
         reality_n = sum(1 for p in working if (p.get("security") or "") == "reality")
         vision_n = sum(1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision")
         tls_n = sum(1 for p in working if p.get("tls_ok"))
-        probe_n = sum(1 for p in working if p.get("probe_resistant"))
-        log.info("Breakdown: Reality=%d, Vision=%d, TLS-OK=%d, PROBE=%d",
-                 reality_n, vision_n, tls_n, probe_n)
+        sni_alive_n = sum(1 for p in working if p.get("probe_resistant"))
+        log.info("Breakdown: Reality=%d, Vision=%d, TLS-OK=%d, SNI-alive=%d",
+                 reality_n, vision_n, tls_n, sni_alive_n)
 
     if not working:
         await send_status(
@@ -178,7 +226,7 @@ async def run(bot: Bot) -> None:
     fresh.sort(key=sort_key)
     log.info("Топ-10:")
     for p in fresh[:10]:
-        log.info("  #%s %s:%s ping=%sms probe=%s tls=%s reality=%s vision=%s",
+        log.info("  #%s %s:%s ping=%sms sni_alive=%s tls=%s reality=%s vision=%s",
                  p.get("id"), p.get("ip"), p.get("port"), p.get("ping"),
                  p.get("probe_resistant"), p.get("tls_ok"),
                  p.get("security"), p.get("flow"))
