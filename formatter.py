@@ -1,4 +1,4 @@
-"""Оформление сообщений о VLESS-ключах."""
+"""Оформление сообщений о VLESS-ключах. Только информация о ключе."""
 from __future__ import annotations
 
 import html
@@ -14,7 +14,7 @@ def _trunc(value: str, max_len: int) -> str:
     value = str(value)
     if len(value) <= max_len:
         return value
-    return value[:max_len - 1] + "…"
+    return value[: max_len - 1] + "…"
 
 
 def _vless_kind(p: dict) -> str:
@@ -32,33 +32,38 @@ def _vless_kind(p: dict) -> str:
 
 def _transport(p: dict) -> str:
     return {
-        "tcp": "TCP", "raw": "RAW", "ws": "WebSocket",
-        "grpc": "gRPC", "http": "HTTP/2", "xhttp": "XHTTP",
+        "tcp": "TCP",
+        "raw": "RAW",
+        "ws": "WebSocket",
+        "grpc": "gRPC",
+        "http": "HTTP/2",
+        "xhttp": "XHTTP",
     }.get((p.get("type") or "tcp").lower(), (p.get("type") or "tcp").upper())
 
 
 def _tls_marker(p: dict) -> str:
     if not p.get("sni"):
         return "—"
-    return "✅ OK" if p.get("tls_ok") else "⚠️ fail (Reality-маскировка)"
+    return "✅ OK" if p.get("tls_ok") else "⚠️ fail"
 
 
 def _mask_label(p: dict) -> str:
+    """Под какой домен маскируется VLESS-ключ (Reality/TLS)."""
     sni = p.get("sni") or "—"
     sec = (p.get("security") or "").lower()
     if sec == "reality":
         return f"🎭 Reality → {html.escape(_trunc(sni, 40))}"
     if sec == "tls":
         return f"🔐 SNI → {html.escape(_trunc(sni, 40))}"
-    return "—"
+    return f"🎭 SNI → {html.escape(_trunc(sni, 40))}"
 
 
 def format_message(p: dict) -> str:
     now = datetime.now(MSK).strftime("%H:%M:%S")
+
     pid = p.get("id", 0)
     flag = p.get("flag") or "🌐"
-    country = _trunc(p.get("country") or "Unknown", 26)
-    name = _trunc(p.get("name") or "", 40)
+    country = _trunc(p.get("country") or "Unknown", 30)
 
     header = f"🚀 #{pid} | {flag} {country}"
     if p.get("probe_resistant"):
@@ -67,27 +72,26 @@ def format_message(p: dict) -> str:
     kind = _vless_kind(p)
     transport = _transport(p)
     ping = p.get("ping", "?")
-    city = _trunc(p.get("city") or "—", 16)
-    provider = _trunc(p.get("provider") or "—", 22)
-
-    title = f"{flag} {country}"
-    title += f" | {name}" if name else f" | {kind}"
+    city = _trunc(p.get("city") or "—", 24)
+    provider = _trunc(p.get("provider") or "—", 30)
+    tls_marker = _tls_marker(p)
+    mask = _mask_label(p)
 
     raw = p.get("raw", "")
-    tag = p.get("source") or ""
-    tag_part = f" | @{tag}" if tag else ""
 
     lines = [
-        html.escape(header), "",
-        "┌ 🏷 Название: " + html.escape(title),
-        f"├ 🔗 Тип: {html.escape(kind)}",
+        html.escape(header),
+        "",
+        f"┌ 🔗 Тип: {html.escape(kind)}",
         f"├ 🌐 Транспорт: {html.escape(transport)}",
         f"├ 📡 Пинг: {html.escape(str(ping))} ms",
         f"├ 🌍 Гео: {html.escape(city)} · {html.escape(provider)}",
-        f"├ 🔒 TLS-хендшейк: {html.escape(_tls_marker(p))}",
-        f"└ {_mask_label(p)}", "",
-        "<b>🔑 VLESS-ключ для подключения:</b>",
-        f"<code>{html.escape(raw)}</code>", "",
-        f"⏱ Проверено: {now}{html.escape(tag_part)}",
+        f"├ 🔒 TLS-хендшейк: {html.escape(tls_marker)}",
+        f"└ {mask}",
+        "",
+        "<b>🔑 VLESS-ключ:</b>",
+        f"<code>{html.escape(raw)}</code>",
+        "",
+        f"⏱ Проверено: {now} МСК",
     ]
     return "\n".join(lines)
