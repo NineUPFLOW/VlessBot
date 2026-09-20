@@ -1,4 +1,4 @@
-"""Сбор VLESS-ключей. Только живые источники."""
+"""Сбор VLESS-ключей: GitHub-подписки + Telegram через Telethon."""
 from __future__ import annotations
 
 import asyncio
@@ -21,28 +21,21 @@ from telethon.tl.types import (
 
 logger = logging.getLogger(__name__)
 
-# Лимит ключей с одной подписки (SoliSpirit отдаёт 280k мусора)
 MAX_PER_SUB = 10000
 
-# ─── GitHub-подписки (только живые по логу) ──────────────────────────
 SUBSCRIPTION_URLS: list[str] = [
-    # Проверены в последнем запуске:
-    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",         # 223
-    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",         # 89
-    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",  # 3892
-    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",  # 4407
-    # Ограничено 10k, иначе 282k мусора:
+    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",
+    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/vless",
     "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt",
 ]
 
-# ─── Telegram-каналы ─────────────────────────────────────────────────
 TELEGRAM_CHANNELS: list[str] = [
-    # Проверены в логе — живые:
-    "dbproxy",              # 199 VLESS
-    "Beshkan",              # 31
-    "v2ray_vless_free",     # 12
-    "free_vless",           # 6
-    # Известные живые (проверятся при запуске):
+    "dbproxy",
+    "Beshkan",
+    "v2ray_vless_free",
+    "free_vless",
     "v2ray_configs_pool",
     "Custom_V2ray_Config",
     "V2rayOutfit",
@@ -113,7 +106,7 @@ def _extract_from_message(msg) -> list[str]:
         entities = getattr(msg, "entities", None) or []
         for ent in entities:
             if isinstance(ent, (MessageEntityCode, MessageEntityPre)):
-                snippet = text[ent.offset:ent.offset + ent.length]
+                snippet = text[ent.offset : ent.offset + ent.length]
                 found.extend(_extract_vless_from_text(snippet))
 
     reply_markup = getattr(msg, "reply_markup", None)
@@ -138,7 +131,6 @@ def _extract_from_message(msg) -> list[str]:
     return found
 
 
-# ─── GitHub-подписки ─────────────────────────────────────────────────
 def _try_base64_decode(text: str) -> str:
     stripped = "".join(text.split())
     if len(stripped) < 32:
@@ -198,8 +190,9 @@ async def fetch_from_subscriptions() -> list[dict]:
     return out
 
 
-# ─── Telegram ────────────────────────────────────────────────────────
-async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
+async def _fetch_from_source(
+    client: TelegramClient, source: str, retry: bool = True
+) -> list[dict]:
     results: list[dict] = []
     try:
         try:
@@ -236,10 +229,20 @@ async def _fetch_from_source(client: TelegramClient, source: str) -> list[dict]:
 
         logger.info(
             "TG @%s: %d сообщений, %d тем → %d VLESS",
-            source, message_count, len(thread_ids), len(results),
+            source,
+            message_count,
+            len(thread_ids),
+            len(results),
         )
     except FloodWaitError as e:
-        await asyncio.sleep(min(e.seconds, 60))
+        wait = min(e.seconds, 60)
+        logger.warning("FloodWait @%s: %ds", source, e.seconds)
+        await asyncio.sleep(wait)
+        if retry:
+            try:
+                return await _fetch_from_source(client, source, retry=False)
+            except Exception:
+                pass
     except Exception as e:
         logger.warning("Source @%s failed: %s", source, e)
 
@@ -276,7 +279,6 @@ async def fetch_from_telegram(channels: list[str]) -> list[dict]:
     return all_items
 
 
-# ─── PUBLIC API ──────────────────────────────────────────────────────
 async def fetch_all_vless() -> list[dict]:
     sub_task = asyncio.create_task(fetch_from_subscriptions())
     tg_task = asyncio.create_task(fetch_from_telegram(TELEGRAM_CHANNELS))
@@ -284,6 +286,7 @@ async def fetch_all_vless() -> list[dict]:
     sub_items, tg_items = await asyncio.gather(sub_task, tg_task)
     all_items = sub_items + tg_items
 
+    # Дедуп #1: (uuid, ip, port)
     seen: set[tuple] = set()
     unique: list[dict] = []
     for it in all_items:
@@ -293,8 +296,20 @@ async def fetch_all_vless() -> list[dict]:
         seen.add(key)
         unique.append(it)
 
+    # Дедуп #2: (ip, port)
+    seen_addr: set[tuple] = set()
+    deduped: list[dict] = []
+    for it in unique:
+        addr = (it["ip"], it["port"])
+        if addr in seen_addr:
+            continue
+        seen_addr.add(addr)
+        deduped.append(it)
+
     logger.info(
-        "Итог: подписки=%d, telegram=%d, уникальных=%d",
-        len(sub_items), len(tg_items), len(unique),
+        "Итог: подписки=%d, telegram=%d, уникальных=%d (после дедупа по addr)",
+        len(sub_items),
+        len(tg_items),
+        len(deduped),
     )
-    return unique
+    return deduped
