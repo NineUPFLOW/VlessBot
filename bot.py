@@ -10,7 +10,11 @@ from collections import defaultdict, deque
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 
 import checker
 import formatter
@@ -22,7 +26,7 @@ SEND_DELAY = 3
 MAX_SEND_RETRIES = 3
 CONCURRENCY = 20
 MAX_VLESS_CHECK = 500
-PER_SOURCE_LIMIT = 80   # сколько максимум брать из одного источника
+PER_SOURCE_LIMIT = 80
 
 
 def _setup_logging() -> None:
@@ -31,8 +35,13 @@ def _setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     for noisy in (
-        "telethon", "telethon.client", "telethon.network",
-        "telethon.extensions", "asyncio", "aiogram.event", "aiohttp.access",
+        "telethon",
+        "telethon.client",
+        "telethon.network",
+        "telethon.extensions",
+        "asyncio",
+        "aiogram.event",
+        "aiohttp.access",
     ):
         logging.getLogger(noisy).setLevel(logging.CRITICAL)
 
@@ -98,19 +107,25 @@ def _balance_by_source(keys: list[dict], total_limit: int) -> list[dict]:
         by_source[k.get("source", "unknown")].append(k)
 
     result: list[dict] = []
+    exhausted: set[str] = set()
     while len(result) < total_limit and by_source:
+        progressed = False
         for src in list(by_source.keys()):
-            if not by_source[src]:
-                del by_source[src]
+            if src in exhausted:
                 continue
-            # Не больше PER_SOURCE_LIMIT из одного источника
+            if not by_source[src]:
+                exhausted.add(src)
+                continue
             src_taken = sum(1 for r in result if r.get("source") == src)
             if src_taken >= PER_SOURCE_LIMIT:
-                del by_source[src]
+                exhausted.add(src)
                 continue
             result.append(by_source[src].popleft())
+            progressed = True
             if len(result) >= total_limit:
                 break
+        if not progressed:
+            break
     return result
 
 
@@ -131,7 +146,9 @@ def sort_key(key: dict):
     return (group, ping)
 
 
-async def send_with_retry(bot: Bot, chat_id: int, text: str, thread_id: int | None) -> bool:
+async def send_with_retry(
+    bot: Bot, chat_id: int, text: str, thread_id: int | None
+) -> bool:
     kwargs: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -146,6 +163,9 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str, thread_id: int | No
             return True
         except TelegramRetryAfter as e:
             await asyncio.sleep(int(e.retry_after) + 1)
+        except TelegramForbiddenError as e:
+            log.error("Bot forbidden in chat %s: %s", chat_id, e)
+            return False
         except TelegramAPIError as e:
             log.warning("send failed (%d): %s", attempt + 1, e)
             await asyncio.sleep(2)
@@ -173,17 +193,15 @@ async def run(bot: Bot) -> None:
         deduped.append(r)
     log.info("После дедупа по (uuid,ip,port): %d", len(deduped))
 
-    # Дедуп #2: по (ip, port) — один сервер = одна запись
+    # Дедуп #2: по (ip, port)
     deduped = _dedup_by_address(deduped)
     log.info("После дедупа по (ip,port): %d", len(deduped))
 
     unseen = state.filter_unseen(deduped)
     log.info("Не видели ранее: %d", len(unseen))
 
-    # Балансировка по источникам
     to_check = _balance_by_source(unseen, MAX_VLESS_CHECK)
 
-    # Диагностика: сколько из какого источника
     src_counts: dict[str, int] = defaultdict(int)
     for k in to_check:
         src_counts[k.get("source", "unknown")] += 1
@@ -191,19 +209,30 @@ async def run(bot: Bot) -> None:
     for src, n in sorted(src_counts.items(), key=lambda x: -x[1])[:15]:
         log.info("  %s: %d", src, n)
 
-    log.info("Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
-             len(to_check), CONCURRENCY, checker.MAX_PING_MS)
+    log.info(
+        "Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
+        len(to_check),
+        CONCURRENCY,
+        checker.MAX_PING_MS,
+    )
 
     working = await check_group(to_check)
     log.info("Проверка: %d → %d рабочих (TCP ok)", len(to_check), len(working))
 
     if working:
         reality_n = sum(1 for p in working if (p.get("security") or "") == "reality")
-        vision_n = sum(1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision")
+        vision_n = sum(
+            1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision"
+        )
         tls_n = sum(1 for p in working if p.get("tls_ok"))
         sni_alive_n = sum(1 for p in working if p.get("probe_resistant"))
-        log.info("Breakdown: Reality=%d, Vision=%d, TLS-OK=%d, SNI-alive=%d",
-                 reality_n, vision_n, tls_n, sni_alive_n)
+        log.info(
+            "Breakdown: Reality=%d, Vision=%d, TLS-OK=%d, SNI-alive=%d",
+            reality_n,
+            vision_n,
+            tls_n,
+            sni_alive_n,
+        )
 
     if not working:
         await send_status(
@@ -226,10 +255,17 @@ async def run(bot: Bot) -> None:
     fresh.sort(key=sort_key)
     log.info("Топ-10:")
     for p in fresh[:10]:
-        log.info("  #%s %s:%s ping=%sms sni_alive=%s tls=%s reality=%s vision=%s",
-                 p.get("id"), p.get("ip"), p.get("port"), p.get("ping"),
-                 p.get("probe_resistant"), p.get("tls_ok"),
-                 p.get("security"), p.get("flow"))
+        log.info(
+            "  #%s %s:%s ping=%sms sni_alive=%s tls=%s reality=%s vision=%s",
+            p.get("id"),
+            p.get("ip"),
+            p.get("port"),
+            p.get("ping"),
+            p.get("probe_resistant"),
+            p.get("tls_ok"),
+            p.get("security"),
+            p.get("flow"),
+        )
 
     to_publish = fresh[:PUBLISH_COUNT]
 
@@ -260,6 +296,9 @@ async def main() -> int:
     token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
         log.error("BOT_TOKEN не задан")
+        return 1
+    if not os.environ.get("CHAT_ID", "").strip():
+        log.error("CHAT_ID не задан")
         return 1
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
