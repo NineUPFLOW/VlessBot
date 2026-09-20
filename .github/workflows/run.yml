@@ -18,19 +18,16 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Validate required secrets
+      - name: Validate secrets
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -40,15 +37,14 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys
-          required = ["BOT_TOKEN", "CHAT_ID", "API_ID", "API_HASH", "TG_SESSION"]
-          missing = [k for k in required if not os.environ.get(k, "").strip()]
+          req = ["BOT_TOKEN", "CHAT_ID", "API_ID", "API_HASH", "TG_SESSION"]
+          missing = [k for k in req if not os.environ.get(k, "").strip()]
           if missing:
-              print("Missing secrets:", ", ".join(missing))
-              sys.exit(1)
-          print("All required secrets present.")
+              print("Missing:", ", ".join(missing)); sys.exit(1)
+          print("OK")
           PY
 
-      - name: Restore state from cache
+      - name: Restore state
         uses: actions/cache/restore@v4
         with:
           key: vless-state-${{ github.ref_name }}-${{ github.run_number }}
@@ -70,24 +66,23 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
         run: python -u bot.py
 
-      - name: Show state stats
+      - name: Show stats
         if: always()
         run: |
           python - <<'PY'
           import os, sqlite3
           if not os.path.exists("vless_state.db"):
-              print("No state DB")
-              raise SystemExit(0)
+              print("No DB"); raise SystemExit(0)
           conn = sqlite3.connect("vless_state.db")
-          for table in ("seen_proxies", "published_proxies"):
+          for t in ("seen_keys", "published_keys"):
               try:
-                  n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                  print(f"{table}: {n}")
+                  n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  print(f"{t}: {n}")
               except Exception as e:
-                  print(f"{table}: error {e}")
+                  print(f"{t}: {e}")
           PY
 
-      - name: Save state to cache
+      - name: Save state
         if: always()
         uses: actions/cache/save@v4
         with:
