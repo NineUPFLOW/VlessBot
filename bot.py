@@ -1,4 +1,4 @@
-"""Точка входа: оркестрация цикла сбора → проверки → публикации."""
+"""Точка входа: сбор VLESS → проверка → публикация."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,7 @@ PUBLISH_COUNT = 10
 SEND_DELAY = 3
 MAX_SEND_RETRIES = 3
 CONCURRENCY = 20
-MAX_VLESS_CHECK = 300
+MAX_VLESS_CHECK = 500
 
 
 def _setup_logging() -> None:
@@ -29,13 +29,8 @@ def _setup_logging() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     for noisy in (
-        "telethon",
-        "telethon.client",
-        "telethon.network",
-        "telethon.extensions",
-        "asyncio",
-        "aiogram.event",
-        "aiohttp.access",
+        "telethon", "telethon.client", "telethon.network",
+        "telethon.extensions", "asyncio", "aiogram.event", "aiohttp.access",
     ):
         logging.getLogger(noisy).setLevel(logging.CRITICAL)
 
@@ -47,7 +42,6 @@ async def send_status(bot: Bot, text: str) -> None:
     chat_id = os.environ.get("CHAT_ID")
     topic_id_raw = os.environ.get("TOPIC_ID", "").strip()
     if not chat_id:
-        log.warning("CHAT_ID не задан, статус не отправлен")
         return
     kwargs: dict = {"chat_id": int(chat_id), "text": text}
     if topic_id_raw:
@@ -65,13 +59,13 @@ async def check_with_semaphore(sem: asyncio.Semaphore, raw: dict) -> dict | None
     async with sem:
         try:
             result = await checker.process_vless(raw)
-        except Exception as e:  # noqa: BLE001
-            log.debug("process_vless error %s: %s", raw.get("ip"), e)
+        except Exception as e:
+            log.debug("process_vless %s: %s", raw.get("ip"), e)
             result = None
         try:
             state.mark_seen(raw)
-        except Exception as e:  # noqa: BLE001
-            log.debug("mark_seen error: %s", e)
+        except Exception as e:
+            log.debug("mark_seen: %s", e)
         return result
 
 
@@ -82,11 +76,12 @@ async def check_group(raws: list[dict]) -> list[dict]:
     return [r for r in results if r is not None]
 
 
-def sort_key(p: dict):
-    probe = bool(p.get("probe_resistant"))
-    reality = (p.get("security") or "").lower() == "reality"
-    vision = (p.get("flow") or "") == "xtls-rprx-vision"
-    ping = p.get("ping", 99999)
+def sort_key(key: dict):
+    """Приоритет: Reality+PROBE → Reality → XTLS-Vision → остальные."""
+    probe = bool(key.get("probe_resistant"))
+    reality = (key.get("security") or "").lower() == "reality"
+    vision = (key.get("flow") or "") == "xtls-rprx-vision"
+    ping = key.get("ping", 99999)
 
     if probe and reality:
         group = 0
@@ -115,11 +110,9 @@ async def send_with_retry(
             await bot.send_message(**kwargs)
             return True
         except TelegramRetryAfter as e:
-            wait = int(e.retry_after) + 1
-            log.warning("RetryAfter %ss", wait)
-            await asyncio.sleep(wait)
+            await asyncio.sleep(int(e.retry_after) + 1)
         except TelegramAPIError as e:
-            log.warning("send failed (attempt %d): %s", attempt + 1, e)
+            log.warning("send failed (%d): %s", attempt + 1, e)
             await asyncio.sleep(2)
     return False
 
@@ -128,13 +121,13 @@ async def run(bot: Bot) -> None:
     state.init_db()
     state.cleanup()
 
-    log.info("Сбор VLESS из Telegram-источников...")
+    log.info("Сбор VLESS-ключей...")
     raws = await fetch_all_vless()
     if not raws:
         await send_status(bot, "⚠️ Источники пусты")
         return
 
-    # дедуп по (uuid, ip, port)
+    # Дедуп по (uuid, ip, port)
     seen_keys: set[tuple] = set()
     deduped: list[dict] = []
     for r in raws:
@@ -144,51 +137,32 @@ async def run(bot: Bot) -> None:
         seen_keys.add(k)
         deduped.append(r)
 
-    log.info("Уникальных VLESS после дедупа: %d", len(deduped))
+    log.info("Уникальных VLESS: %d", len(deduped))
 
     unseen = state.filter_unseen(deduped)
-    log.info("Не видели ранее: %d из %d", len(unseen), len(deduped))
+    log.info("Не видели ранее: %d", len(unseen))
 
     to_check = unseen[:MAX_VLESS_CHECK]
-    log.info(
-        "Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
-        len(to_check),
-        CONCURRENCY,
-        checker.MAX_PING_MS,
-    )
+    log.info("Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
+             len(to_check), CONCURRENCY, checker.MAX_PING_MS)
 
     working = await check_group(to_check)
-    log.info(
-        "Проверка: %d проверено → %d рабочих (TCP ok)",
-        len(to_check),
-        len(working),
-    )
+    log.info("Проверка: %d → %d рабочих (TCP ok)", len(to_check), len(working))
 
     if working:
-        reality_n = sum(
-            1 for p in working if (p.get("security") or "") == "reality"
-        )
+        reality_n = sum(1 for p in working if (p.get("security") or "") == "reality")
+        vision_n = sum(1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision")
         tls_n = sum(1 for p in working if p.get("tls_ok"))
         probe_n = sum(1 for p in working if p.get("probe_resistant"))
-        vision_n = sum(
-            1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision"
-        )
-        log.info(
-            "Breakdown: Reality=%d, XTLS-Vision=%d, TLS-handshake-OK=%d, PROBE=%d",
-            reality_n,
-            vision_n,
-            tls_n,
-            probe_n,
-        )
+        log.info("Breakdown: Reality=%d, Vision=%d, TLS-OK=%d, PROBE=%d",
+                 reality_n, vision_n, tls_n, probe_n)
 
     if not working:
         await send_status(
             bot,
-            "⚠️ Ни один прокси не прошёл TCP-проверку\n\n"
-            f"Проверено кандидатов: {len(to_check)}\n"
-            "Все либо недоступны, либо пинг > "
-            f"{checker.MAX_PING_MS} мс.\n\n"
-            "Проверю снова через 10 минут.",
+            "⚠️ Ни один VLESS-ключ не прошёл TCP-проверку\n\n"
+            f"Проверено: {len(to_check)}\n"
+            f"Все недоступны или пинг > {checker.MAX_PING_MS} мс.",
         )
         return
 
@@ -196,57 +170,41 @@ async def run(bot: Bot) -> None:
     if not fresh:
         await send_status(
             bot,
-            "💤 Все рабочие прокси уже публиковались\n\n"
-            f"Проверено рабочих: {len(working)}\n"
-            "Все они были опубликованы недавно.\n\n"
-            "Жду появления новых прокси в источниках.",
+            "💤 Все рабочие VLESS уже публиковались\n\n"
+            f"Рабочих: {len(working)}\nЖду новых ключей.",
         )
         return
 
     fresh.sort(key=sort_key)
-    log.info("Топ-10 после сортировки:")
+    log.info("Топ-10:")
     for p in fresh[:10]:
-        log.info(
-            "  #%s %s:%s ping=%sms probe=%s tls=%s reality=%s vision=%s",
-            p.get("id"),
-            p.get("ip"),
-            p.get("port"),
-            p.get("ping"),
-            p.get("probe_resistant"),
-            p.get("tls_ok"),
-            p.get("security"),
-            p.get("flow"),
-        )
+        log.info("  #%s %s:%s ping=%sms probe=%s tls=%s reality=%s vision=%s",
+                 p.get("id"), p.get("ip"), p.get("port"), p.get("ping"),
+                 p.get("probe_resistant"), p.get("tls_ok"),
+                 p.get("security"), p.get("flow"))
 
     to_publish = fresh[:PUBLISH_COUNT]
 
-    chat_id_raw = os.environ.get("CHAT_ID", "").strip()
-    if not chat_id_raw:
-        log.error("CHAT_ID не задан")
-        return
-    chat_id = int(chat_id_raw)
+    chat_id = int(os.environ["CHAT_ID"])
     thread_id: int | None = None
     topic_raw = os.environ.get("TOPIC_ID", "").strip()
     if topic_raw:
         try:
             thread_id = int(topic_raw)
         except ValueError:
-            thread_id = None
+            pass
 
-    published_count = 0
+    published = 0
     for i, p in enumerate(to_publish):
         text = formatter.format_message(p)
-        ok = await send_with_retry(bot, chat_id, text, thread_id)
-        if ok:
+        if await send_with_retry(bot, chat_id, text, thread_id):
             state.mark_published(p)
-            published_count += 1
-            log.info(
-                "Опубликован #%s (%s:%s)", p.get("id"), p.get("ip"), p.get("port")
-            )
+            published += 1
+            log.info("Опубликован #%s", p.get("id"))
         if i < len(to_publish) - 1:
             await asyncio.sleep(SEND_DELAY)
 
-    log.info("Опубликовано: %d", published_count)
+    log.info("Опубликовано: %d", published)
 
 
 async def main() -> int:
@@ -259,8 +217,8 @@ async def main() -> int:
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     try:
         await run(bot)
-    except Exception as e:  # noqa: BLE001
-        log.exception("Fatal error: %s", e)
+    except Exception as e:
+        log.exception("Fatal: %s", e)
         return 1
     finally:
         await checker.close_http_session()
