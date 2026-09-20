@@ -1,13 +1,6 @@
 """
 Проверка VLESS-конфигов.
-
-VLESS — это НЕ прокси. Нельзя выполнить "handshake" как с MTProto.
-Сервер не подтверждает валидность UUID.
-
-Проверка VLESS = TCP + TLS-хендшейк к SNI-домену:
-- TCP: сервер отвечает на порт (жёсткий фильтр)
-- TLS: сервер завершает рукопожатие под SNI-домен (маскировка работает)
-- Probe: SNI-домен реально существует и отвечает (белый IP, не палится при зондировании)
+TCP — жёсткий фильтр. TLS и probe — информационно для скоринга.
 """
 from __future__ import annotations
 
@@ -21,20 +14,14 @@ import time
 
 import aiohttp
 
-for name in (
-    "telethon",
-    "telethon.network",
-    "telethon.client",
-    "asyncio",
-):
+for name in ("telethon", "telethon.network", "telethon.client", "asyncio"):
     logging.getLogger(name).setLevel(logging.CRITICAL)
 
 logger = logging.getLogger(__name__)
 
-# ─── Лимиты ────────────────────────────────────────────────────────────
-MAX_PING_MS = 5000          # TCP-пинг. GitHub Actions → Азия/Иран часто 4000+
-TCP_TIMEOUT = 8             # таймаут TCP-подключения
-TLS_TIMEOUT = 8             # таймаут TLS-хендшейка
+MAX_PING_MS = 5000
+TCP_TIMEOUT = 8
+TLS_TIMEOUT = 8
 PROBE_TIMEOUT = 5
 
 _http_session: aiohttp.ClientSession | None = None
@@ -42,6 +29,7 @@ _geo_cache: dict[str, dict] = {}
 _probe_cache: dict[str, bool] = {}
 _geo_semaphore = asyncio.Semaphore(5)
 PROBE_CACHE_LIMIT = 5000
+GEO_CACHE_LIMIT = 2000
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -53,29 +41,29 @@ def _get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
-async def close_http_session():
+async def close_http_session() -> None:
     global _http_session
     if _http_session is not None and not _http_session.closed:
         await _http_session.close()
         _http_session = None
 
 
-# ─── Скоринг ───────────────────────────────────────────────────────────
 def compute_score(key: dict) -> int:
-    """VLESS-приоритеты: Reality > Vision > Probe > Ping."""
+    """VLESS-приоритеты: Reality > Vision > Probe > TLS > Ping."""
     score = 10000
     security = (key.get("security") or "").lower()
     if security == "reality":
-        score += 3000           # Reality — приоритет, маскируется под реальный сайт
+        score += 3000
     if key.get("flow") == "xtls-rprx-vision":
-        score += 2000           # XTLS-Vision — устойчив к DPI
+        score += 2000
     if key.get("probe_resistant"):
-        score += 1000           # SNI-домен живой → не палится при зондировании
+        score += 1000
+    if key.get("tls_ok"):
+        score += 500
     ping = key.get("ping", 5000)
     return score - min(int(ping), 5000)
 
 
-# ─── Утилиты ───────────────────────────────────────────────────────────
 def _is_ip(s: str) -> bool:
     try:
         ipaddress.ip_address(s)
@@ -85,7 +73,7 @@ def _is_ip(s: str) -> bool:
 
 
 async def _resolve_all(host: str) -> list[str]:
-    """Все IP хоста, IPv4 в приоритете. Пробуем до 3 адресов."""
+    """Все IP хоста, IPv4 в приоритете."""
     if _is_ip(host):
         return [host]
     try:
@@ -118,6 +106,9 @@ def _country_flag(code: str) -> str:
 
 
 async def geolocate(ip: str) -> dict:
+    global _geo_cache
+    if len(_geo_cache) > GEO_CACHE_LIMIT:
+        _geo_cache.clear()
     if ip in _geo_cache:
         return _geo_cache[ip]
     async with _geo_semaphore:
@@ -144,10 +135,8 @@ async def geolocate(ip: str) -> dict:
     return {}
 
 
-# ─── PROBE RESISTANCE TEST (для Reality/TLS) ──────────────────────────
 async def check_probe_resistant(domain: str) -> bool:
-    """Проверяет, что SNI-домен реально существует и отвечает.
-    Если да — VLESS-сервер маскируется под живой сайт и не палится при зондировании."""
+    """SNI-домен реально существует и отвечает (из US-раннера)."""
     if not domain:
         return False
     if domain in _probe_cache:
@@ -170,11 +159,7 @@ async def check_probe_resistant(domain: str) -> bool:
     return is_real
 
 
-# ─── TCP CHECK (жёсткий фильтр) ───────────────────────────────────────
 async def check_tcp(host: str, port: int) -> int | None:
-    """Открывает TCP-соединение и меряет пинг.
-    Это единственный жёсткий фильтр для VLESS — если порт не отвечает,
-    ключ мёртв."""
     try:
         t0 = time.perf_counter()
         reader, writer = await asyncio.wait_for(
@@ -191,11 +176,7 @@ async def check_tcp(host: str, port: int) -> int | None:
         return None
 
 
-# ─── TLS CHECK (Reality / TLS) ────────────────────────────────────────
 def _tls_handshake_sync(host: str, port: int, sni: str) -> bool:
-    """TLS-хендшейк к SNI-домену.
-    Для Reality это подтверждает, что VLESS-сервер отвечает и маскируется.
-    Для обычного TLS — что сертификат валиден."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -220,34 +201,35 @@ async def check_tls(host: str, port: int, sni: str) -> bool:
         return False
 
 
-# ─── ENRICH ───────────────────────────────────────────────────────────
-def _enrich(key: dict, ip: str, ping: int, geo: dict, probe_ok: bool,
-            tls_ok: bool) -> dict:
+def _enrich(
+    key: dict, ip: str, ping: int, geo: dict, probe_ok: bool, tls_ok: bool
+) -> dict:
     country_code = geo.get("countryCode", "")
-    key.update({
-        "ip": ip,
-        "ping": ping,
-        "id": _stable_id(ip, key["port"]),
-        "country": geo.get("country", "Unknown"),
-        "countryCode": country_code,
-        "city": geo.get("city", "Unknown"),
-        "provider": geo.get("isp", "Unknown"),
-        "flag": _country_flag(country_code),
-        "probe_resistant": probe_ok,
-        "tls_ok": tls_ok,
-    })
+    key.update(
+        {
+            "ip": ip,
+            "ping": ping,
+            "id": _stable_id(ip, key["port"]),
+            "country": geo.get("country", "Unknown"),
+            "countryCode": country_code,
+            "city": geo.get("city", "Unknown"),
+            "provider": geo.get("isp", "Unknown"),
+            "flag": _country_flag(country_code),
+            "probe_resistant": probe_ok,
+            "tls_ok": tls_ok,
+        }
+    )
     key["score"] = compute_score(key)
     return key
 
 
-# ─── MAIN PROCESS ─────────────────────────────────────────────────────
 async def process_vless(raw: dict) -> dict | None:
     """
-    1. Резолв (все IP, IPv4 вперёд)
+    1. Резолв (IPv4 вперёд)
     2. TCP (жёсткий фильтр, до 3 IP)
-    3. TLS-хендшейк (информационно, не отбраковывает)
-    4. Probe SNI-домена (информационно, для score)
-    5. Гео (опционально, не отбраковывает)
+    3. TLS-хендшейк (информационно)
+    4. Probe SNI-домена (информационно)
+    5. Гео (опционально)
     """
     host = raw.get("ip")
     port = raw.get("port")
@@ -257,12 +239,10 @@ async def process_vless(raw: dict) -> dict | None:
     if not host or not port:
         return None
 
-    # 1. Резолв
     ips = await _resolve_all(host)
     if not ips:
         return None
 
-    # 2. TCP — жёсткий фильтр
     ip = None
     ping: int | None = None
     for candidate in ips[:3]:
@@ -275,17 +255,14 @@ async def process_vless(raw: dict) -> dict | None:
     if ip is None:
         return None
 
-    # 3. TLS-хендшейк — ТОЛЬКО для Reality/TLS, но НЕ отбраковывает
     tls_ok = False
     if security in ("reality", "tls") and sni:
         tls_ok = await check_tls(ip, port, sni)
 
-    # 4. Probe SNI-домена — не отбраковывает
     probe_ok = False
     if sni:
         probe_ok = await check_probe_resistant(sni)
 
-    # 5. Гео — опционально
     geo = await geolocate(ip) or {}
 
     return _enrich(raw, ip, ping, geo, probe_ok, tls_ok)
