@@ -20,7 +20,7 @@ PUBLISH_COUNT = 10
 SEND_DELAY = 3
 MAX_SEND_RETRIES = 3
 CONCURRENCY = 20
-MAX_VLESS_CHECK = 500
+MAX_VLESS_CHECK = 300
 
 
 def _setup_logging() -> None:
@@ -99,7 +99,9 @@ def sort_key(p: dict):
     return (group, ping)
 
 
-async def send_with_retry(bot: Bot, chat_id: int, text: str, thread_id: int | None) -> bool:
+async def send_with_retry(
+    bot: Bot, chat_id: int, text: str, thread_id: int | None
+) -> bool:
     kwargs: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -142,16 +144,52 @@ async def run(bot: Bot) -> None:
         seen_keys.add(k)
         deduped.append(r)
 
+    log.info("Уникальных VLESS после дедупа: %d", len(deduped))
+
     unseen = state.filter_unseen(deduped)
     log.info("Не видели ранее: %d из %d", len(unseen), len(deduped))
 
     to_check = unseen[:MAX_VLESS_CHECK]
-    log.info("Проверяем %d ключей (CONCURRENCY=%d)...", len(to_check), CONCURRENCY)
+    log.info(
+        "Проверяем %d ключей (CONCURRENCY=%d, MAX_PING_MS=%d)...",
+        len(to_check),
+        CONCURRENCY,
+        checker.MAX_PING_MS,
+    )
+
     working = await check_group(to_check)
-    log.info("Рабочих прокси: %d", len(working))
+    log.info(
+        "Проверка: %d проверено → %d рабочих (TCP ok)",
+        len(to_check),
+        len(working),
+    )
+
+    if working:
+        reality_n = sum(
+            1 for p in working if (p.get("security") or "") == "reality"
+        )
+        tls_n = sum(1 for p in working if p.get("tls_ok"))
+        probe_n = sum(1 for p in working if p.get("probe_resistant"))
+        vision_n = sum(
+            1 for p in working if (p.get("flow") or "") == "xtls-rprx-vision"
+        )
+        log.info(
+            "Breakdown: Reality=%d, XTLS-Vision=%d, TLS-handshake-OK=%d, PROBE=%d",
+            reality_n,
+            vision_n,
+            tls_n,
+            probe_n,
+        )
 
     if not working:
-        await send_status(bot, "⚠️ Ни один прокси не прошёл проверку")
+        await send_status(
+            bot,
+            "⚠️ Ни один прокси не прошёл TCP-проверку\n\n"
+            f"Проверено кандидатов: {len(to_check)}\n"
+            "Все либо недоступны, либо пинг > "
+            f"{checker.MAX_PING_MS} мс.\n\n"
+            "Проверю снова через 10 минут.",
+        )
         return
 
     fresh = state.filter_unpublished(working)
@@ -169,12 +207,13 @@ async def run(bot: Bot) -> None:
     log.info("Топ-10 после сортировки:")
     for p in fresh[:10]:
         log.info(
-            "  #%s %s %s ping=%sms probe=%s reality=%s vision=%s",
+            "  #%s %s:%s ping=%sms probe=%s tls=%s reality=%s vision=%s",
             p.get("id"),
             p.get("ip"),
             p.get("port"),
             p.get("ping"),
             p.get("probe_resistant"),
+            p.get("tls_ok"),
             p.get("security"),
             p.get("flow"),
         )
@@ -201,7 +240,9 @@ async def run(bot: Bot) -> None:
         if ok:
             state.mark_published(p)
             published_count += 1
-            log.info("Опубликован #%s (%s:%s)", p.get("id"), p.get("ip"), p.get("port"))
+            log.info(
+                "Опубликован #%s (%s:%s)", p.get("id"), p.get("ip"), p.get("port")
+            )
         if i < len(to_publish) - 1:
             await asyncio.sleep(SEND_DELAY)
 
