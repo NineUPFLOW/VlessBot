@@ -28,7 +28,8 @@ def init_db() -> None:
     conn = _get_conn()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript("""
+    conn.executescript(
+        """
         CREATE TABLE IF NOT EXISTS seen_keys (
             hash TEXT PRIMARY KEY,
             ip TEXT NOT NULL,
@@ -54,7 +55,8 @@ def init_db() -> None:
             name TEXT PRIMARY KEY,
             value TEXT
         );
-    """)
+        """
+    )
     logger.info("DB initialized")
 
 
@@ -68,11 +70,15 @@ def _normalize(key: dict) -> dict | None:
         port = int(port)
     except (TypeError, ValueError):
         return None
+    if port <= 0 or port > 65535:
+        return None
     return {"ip": str(ip), "port": port, "protocol": proto}
 
 
 def _hash(p: dict) -> str:
-    return hashlib.sha256(f"{p['ip']}:{p['port']}:{p['protocol']}".encode()).hexdigest()[:16]
+    return hashlib.sha256(
+        f"{p['ip']}:{p['port']}:{p['protocol']}".encode()
+    ).hexdigest()[:16]
 
 
 def mark_seen(key: dict) -> None:
@@ -112,7 +118,9 @@ def mark_published(key: dict) -> None:
     )
 
 
-def _bulk_filter(keys: list[dict], table: str, time_col: str, ttl: int) -> list[dict]:
+def _bulk_filter(
+    keys: list[dict], table: str, time_col: str, ttl: int
+) -> list[dict]:
     if not keys:
         return []
     cutoff = int(time.time()) - ttl
@@ -134,7 +142,7 @@ def _bulk_filter(keys: list[dict], table: str, time_col: str, ttl: int) -> list[
     fresh: set[str] = set()
     CHUNK = 500
     for i in range(0, len(hashes), CHUNK):
-        chunk = hashes[i:i + CHUNK]
+        chunk = hashes[i : i + CHUNK]
         placeholders = ",".join("?" for _ in chunk)
         rows = conn.execute(
             f"SELECT hash FROM {table} WHERE hash IN ({placeholders}) AND {time_col} >= ?",
@@ -155,7 +163,9 @@ def filter_unpublished(keys: list[dict]) -> list[dict]:
 
 
 def get_flag(name: str) -> str | None:
-    row = _get_conn().execute("SELECT value FROM flags WHERE name=?", (name,)).fetchone()
+    row = _get_conn().execute(
+        "SELECT value FROM flags WHERE name=?", (name,)
+    ).fetchone()
     return row["value"] if row else None
 
 
@@ -171,5 +181,7 @@ def cleanup() -> None:
     now = int(time.time())
     conn = _get_conn()
     conn.execute("DELETE FROM seen_keys WHERE last_seen < ?", (now - SEEN_TTL,))
-    conn.execute("DELETE FROM published_keys WHERE published_at < ?", (now - PUBLISHED_TTL,))
+    conn.execute(
+        "DELETE FROM published_keys WHERE published_at < ?", (now - PUBLISHED_TTL,)
+    )
     logger.info("DB cleanup done")
