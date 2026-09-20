@@ -11,6 +11,9 @@ vless_state.db
 vless_state.db-journal
 vless_state.db-wal
 vless_state.db-shm
+*.db
+*.db-wal
+*.db-shm
 seen.json
 .vscode/
 .idea/
