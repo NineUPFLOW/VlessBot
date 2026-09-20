@@ -1,4 +1,4 @@
-"""Проверка VLESS-конфигов: TCP, TLS, probe, геолокация."""
+"""Проверка VLESS-конфигов: TCP (жёсткий фильтр), TLS/probe (информационно), гео."""
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +13,11 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-MAX_PING_MS = 3000
-TCP_TIMEOUT = 5
-TLS_TIMEOUT = 5
-PROBE_TIMEOUT = 5
+# ── Лимиты (подняты — GitHub Actions → Азия/Иран часто 4–6 сек) ──
+MAX_PING_MS = 5000          # жёсткий порог по TCP-пингу
+TCP_TIMEOUT = 8             # таймаут TCP-подключения
+TLS_TIMEOUT = 8             # таймаут TLS (только информационно)
+PROBE_TIMEOUT = 6
 
 _session: aiohttp.ClientSession | None = None
 _geo_cache: dict[str, dict] = {}
@@ -39,20 +40,30 @@ async def close_http_session() -> None:
         _session = None
 
 
-async def _resolve(host: str) -> str | None:
+async def _resolve_all(host: str) -> list[str]:
+    """Все IP хоста, IPv4 в приоритете."""
     try:
         socket.inet_aton(host)
-        return host
+        return [host]
     except OSError:
         pass
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        if infos:
-            return infos[0][4][0]
+        pairs: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for fam, _, _, _, sockaddr in infos:
+            ip = sockaddr[0]
+            if ip in seen:
+                continue
+            seen.add(ip)
+            pairs.append((fam, ip))
+        # IPv4 вперёд
+        pairs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+        return [ip for _, ip in pairs]
     except Exception as e:  # noqa: BLE001
         log.debug("resolve %s failed: %s", host, e)
-    return None
+        return []
 
 
 async def check_tcp(host: str, port: int) -> int | None:
@@ -85,6 +96,9 @@ def _tls_handshake_sync(host: str, port: int, sni: str) -> bool:
 
 
 async def check_tls(host: str, port: int, sni: str) -> bool:
+    """Информационная проверка. НЕ используется для отбраковки."""
+    if not sni:
+        return False
     loop = asyncio.get_running_loop()
     try:
         return await asyncio.wait_for(
@@ -116,6 +130,7 @@ async def check_probe_resistant(sni: str) -> bool:
 
 
 async def geolocate(ip: str) -> dict | None:
+    """None — если не удалось. НЕ роняет прокси."""
     async with _geo_lock:
         cached = _geo_cache.get(ip)
         if cached is not None:
@@ -126,7 +141,9 @@ async def geolocate(ip: str) -> dict | None:
     data: dict | None = None
     for attempt in range(3):
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT)) as resp:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT)
+            ) as resp:
                 if resp.status == 429:
                     await asyncio.sleep(1 + attempt)
                     continue
@@ -170,6 +187,7 @@ def _enrich(
     ping: int,
     geo: dict,
     probe_ok: bool,
+    tls_ok: bool,
 ) -> dict:
     out = dict(proxy)
     out["ip"] = ip
@@ -180,6 +198,7 @@ def _enrich(
     out["flag"] = _flag_from_code(geo.get("countryCode", ""))
     out["ping"] = ping
     out["probe_resistant"] = probe_ok
+    out["tls_ok"] = tls_ok
     out["id"] = _stable_id(ip, out["port"])
     out["score"] = compute_score(out)
     return out
@@ -193,6 +212,8 @@ def compute_score(proxy: dict) -> int:
         score += 2000
     if proxy.get("probe_resistant"):
         score += 1000
+    if proxy.get("tls_ok"):
+        score += 500
     ping = proxy.get("ping", 5000)
     return score - min(int(ping), 5000)
 
@@ -204,25 +225,37 @@ async def process_vless(raw: dict) -> dict | None:
     if not host or not port:
         return None
 
-    ip = await _resolve(host)
-    if not ip:
+    # 1. Резолв — все IP, IPv4 вперёд
+    ips = await _resolve_all(host)
+    if not ips:
+        log.debug("DNS fail %s", host)
         return None
 
-    ping = await check_tcp(ip, port)
-    if ping is None or ping > MAX_PING_MS:
+    # 2. TCP — жёсткий фильтр, пробуем до 3 IP
+    ip = None
+    ping: int | None = None
+    for candidate in ips[:3]:
+        p = await check_tcp(candidate, port)
+        if p is not None and p <= MAX_PING_MS:
+            ip = candidate
+            ping = p
+            break
+
+    if ip is None:
+        log.debug("TCP fail %s:%s", host, port)
         return None
 
+    # 3. TLS — ТОЛЬКО информационно, не отбраковываем
+    tls_ok = False
     if raw.get("security") in ("reality", "tls") and sni:
         tls_ok = await check_tls(ip, port, sni)
-        if not tls_ok:
-            return None
 
+    # 4. Probe SNI-домена — тоже не отбраковывает
     probe_ok = False
     if sni:
         probe_ok = await check_probe_resistant(sni)
 
-    geo = await geolocate(ip)
-    if not geo:
-        return None
+    # 5. Гео — опционально
+    geo = await geolocate(ip) or {}
 
-    return _enrich(raw, ip, ping, geo, probe_ok)
+    return _enrich(raw, ip, ping, geo, probe_ok, tls_ok)
