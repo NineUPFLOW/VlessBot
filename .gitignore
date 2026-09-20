@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.env
+session/
+*.session
+*.session-journal
+vless_state.db
+vless_state.db-journal
+vless_state.db-wal
+vless_state.db-shm
+seen.json
+.vscode/
+.idea/
+*.swp
