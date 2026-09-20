@@ -46,11 +46,13 @@ def _source_tag(url: str) -> str:
     """Уникальный тег вида owner/repo:filename."""
     try:
         parts = url.rstrip("/").split("/")
-        # .../owner/repo/branch/path/file
-        owner = parts[-4]
-        repo = parts[-3]
-        filename = parts[-1]
-        return f"{owner}/{repo}:{filename}"
+        if "raw.githubusercontent.com" in parts:
+            idx = parts.index("raw.githubusercontent.com")
+            owner = parts[idx + 1]
+            repo = parts[idx + 2]
+            filename = parts[-1]
+            return f"{owner}/{repo}:{filename}"
+        return url.rsplit("/", 1)[-1]
     except Exception:
         return url.rsplit("/", 1)[-1]
 
