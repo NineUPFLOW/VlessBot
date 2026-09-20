@@ -1,6 +1,6 @@
 """
 Проверка VLESS-конфигов.
-TCP — жёсткий фильтр. TLS и probe — информационно для скоринга.
+TCP — жёсткий фильтр. TLS, probe, geo — параллельно.
 """
 from __future__ import annotations
 
@@ -20,9 +20,10 @@ for name in ("telethon", "telethon.network", "telethon.client", "asyncio"):
 logger = logging.getLogger(__name__)
 
 MAX_PING_MS = 5000
-TCP_TIMEOUT = 8
-TLS_TIMEOUT = 8
-PROBE_TIMEOUT = 5
+TCP_TIMEOUT = 6
+TLS_TIMEOUT = 5
+PROBE_TIMEOUT = 3
+GEO_TIMEOUT = 5
 
 _http_session: aiohttp.ClientSession | None = None
 _geo_cache: dict[str, dict] = {}
@@ -49,7 +50,6 @@ async def close_http_session() -> None:
 
 
 def compute_score(key: dict) -> int:
-    """VLESS-приоритеты: Reality > Vision > Probe > TLS > Ping."""
     score = 10000
     security = (key.get("security") or "").lower()
     if security == "reality":
@@ -73,7 +73,6 @@ def _is_ip(s: str) -> bool:
 
 
 async def _resolve_all(host: str) -> list[str]:
-    """Все IP хоста, IPv4 в приоритете."""
     if _is_ip(host):
         return [host]
     try:
@@ -113,15 +112,15 @@ async def geolocate(ip: str) -> dict:
         return _geo_cache[ip]
     async with _geo_semaphore:
         session = _get_http_session()
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 async with session.get(
                     f"http://ip-api.com/json/{ip}"
                     "?fields=status,country,countryCode,city,isp,query",
-                    timeout=aiohttp.ClientTimeout(total=8),
+                    timeout=aiohttp.ClientTimeout(total=GEO_TIMEOUT),
                 ) as r:
                     if r.status == 429:
-                        await asyncio.sleep(2 * (attempt + 1))
+                        await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     if r.status == 200:
                         data = await r.json()
@@ -131,12 +130,11 @@ async def geolocate(ip: str) -> dict:
                     return {}
             except Exception as e:
                 logger.debug("geolocate(%s) #%s: %s", ip, attempt + 1, e)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
     return {}
 
 
 async def check_probe_resistant(domain: str) -> bool:
-    """SNI-домен реально существует и отвечает (из US-раннера)."""
     if not domain:
         return False
     if domain in _probe_cache:
@@ -201,6 +199,13 @@ async def check_tls(host: str, port: int, sni: str) -> bool:
         return False
 
 
+async def _safe(coro, default):
+    try:
+        return await coro
+    except Exception:
+        return default
+
+
 def _enrich(
     key: dict, ip: str, ping: int, geo: dict, probe_ok: bool, tls_ok: bool
 ) -> dict:
@@ -225,11 +230,9 @@ def _enrich(
 
 async def process_vless(raw: dict) -> dict | None:
     """
-    1. Резолв (IPv4 вперёд)
-    2. TCP (жёсткий фильтр, до 3 IP)
-    3. TLS-хендшейк (информационно)
-    4. Probe SNI-домена (информационно)
-    5. Гео (опционально)
+    1. Резолв
+    2. TCP (жёсткий фильтр)
+    3. TLS + probe + geo — ПАРАЛЛЕЛЬНО
     """
     host = raw.get("ip")
     port = raw.get("port")
@@ -255,14 +258,27 @@ async def process_vless(raw: dict) -> dict | None:
     if ip is None:
         return None
 
-    tls_ok = False
-    if security in ("reality", "tls") and sni:
-        tls_ok = await check_tls(ip, port, sni)
+    # Параллельно: TLS + probe + geo
+    tls_coro = (
+        check_tls(ip, port, sni)
+        if security in ("reality", "tls") and sni
+        else _safe(_noop(), False)
+    )
+    probe_coro = (
+        check_probe_resistant(sni) if sni else _safe(_noop(), False)
+    )
 
-    probe_ok = False
-    if sni:
-        probe_ok = await check_probe_resistant(sni)
+    tls_ok, probe_ok, geo = await asyncio.gather(
+        _safe(tls_coro, False),
+        _safe(probe_coro, False),
+        _safe(geolocate(ip), {}),
+    )
 
-    geo = await geolocate(ip) or {}
+    if not geo:
+        geo = {}
 
     return _enrich(raw, ip, ping, geo, probe_ok, tls_ok)
+
+
+async def _noop() -> bool:
+    return False
