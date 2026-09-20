@@ -1,4 +1,4 @@
-"""Оформление сообщений о VLESS-ключах. Только информация о ключе."""
+"""Оформление сообщений о VLESS-ключах. Только правда: никаких «белых IP»."""
 from __future__ import annotations
 
 import html
@@ -18,7 +18,6 @@ def _trunc(value: str, max_len: int) -> str:
 
 
 def _vless_kind(p: dict) -> str:
-    """VLESS + Reality/TLS + XTLS-Vision."""
     parts = ["VLESS"]
     sec = (p.get("security") or "").lower()
     if sec == "reality":
@@ -32,12 +31,8 @@ def _vless_kind(p: dict) -> str:
 
 def _transport(p: dict) -> str:
     return {
-        "tcp": "TCP",
-        "raw": "RAW",
-        "ws": "WebSocket",
-        "grpc": "gRPC",
-        "http": "HTTP/2",
-        "xhttp": "XHTTP",
+        "tcp": "TCP", "raw": "RAW", "ws": "WebSocket",
+        "grpc": "gRPC", "http": "HTTP/2", "xhttp": "XHTTP",
     }.get((p.get("type") or "tcp").lower(), (p.get("type") or "tcp").upper())
 
 
@@ -48,14 +43,19 @@ def _tls_marker(p: dict) -> str:
 
 
 def _mask_label(p: dict) -> str:
-    """Под какой домен маскируется VLESS-ключ (Reality/TLS)."""
+    """Под какой домен маскируется VLESS + статус SNI-домена.
+    ✅ = SNI-домен отвечает из US-раннера (не значит что не заблокирован в РФ)
+    ⚠️ = SNI-домен не отвечает."""
     sni = p.get("sni") or "—"
     sec = (p.get("security") or "").lower()
+    sni_alive = p.get("probe_resistant", False)
+    sni_status = "🟢" if sni_alive else "🔴"
+
     if sec == "reality":
-        return f"🎭 Reality → {html.escape(_trunc(sni, 40))}"
+        return f"🎭 Reality → {html.escape(_trunc(sni, 36))} {sni_status}"
     if sec == "tls":
-        return f"🔐 SNI → {html.escape(_trunc(sni, 40))}"
-    return f"🎭 SNI → {html.escape(_trunc(sni, 40))}"
+        return f"🔐 SNI → {html.escape(_trunc(sni, 36))} {sni_status}"
+    return f"🎭 SNI → {html.escape(_trunc(sni, 36))} {sni_status}"
 
 
 def format_message(p: dict) -> str:
@@ -65,9 +65,8 @@ def format_message(p: dict) -> str:
     flag = p.get("flag") or "🌐"
     country = _trunc(p.get("country") or "Unknown", 30)
 
+    # Шапка — без «БЕЛЫЙ IP» (это былa ложь)
     header = f"🚀 #{pid} | {flag} {country}"
-    if p.get("probe_resistant"):
-        header += " ⬜ БЕЛЫЙ IP"
 
     kind = _vless_kind(p)
     transport = _transport(p)
@@ -84,7 +83,7 @@ def format_message(p: dict) -> str:
         "",
         f"┌ 🔗 Тип: {html.escape(kind)}",
         f"├ 🌐 Транспорт: {html.escape(transport)}",
-        f"├ 📡 Пинг: {html.escape(str(ping))} ms",
+        f"├ 📡 Пинг: {html.escape(str(ping))} ms (из 🇺🇸 US-раннера)",
         f"├ 🌍 Гео: {html.escape(city)} · {html.escape(provider)}",
         f"├ 🔒 TLS-хендшейк: {html.escape(tls_marker)}",
         f"└ {mask}",
