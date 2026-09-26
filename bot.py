@@ -25,7 +25,7 @@ PUBLISH_COUNT = 10
 SEND_DELAY = 3
 MAX_SEND_RETRIES = 3
 CONCURRENCY = 20
-MAX_VLESS_CHECK = 500
+MAX_VLESS_CHECK = 1000
 PER_SOURCE_LIMIT = 250
 
 
@@ -198,7 +198,7 @@ async def run(bot: Bot) -> None:
     log.info("После дедупа по (ip,port): %d", len(deduped))
 
     unseen = state.filter_unseen(deduped)
-    log.info("Не видели ранее: %d", len(unseen))
+    log.info("Unseen count=%d", len(unseen))
 
     to_check = _balance_by_source(unseen, MAX_VLESS_CHECK)
 
