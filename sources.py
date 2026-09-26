@@ -90,8 +90,6 @@ TELEGRAM_CHANNELS: list[str] = [
     "bypassawm",
     "forumhappcluchi",
     "kfwlforum",
-    "halyava_vpnx",
-    "Unblock_Tech",
 ]
 
 RE_VLESS = re.compile(r"vless://[^\s<>\"'\)\]]+")
