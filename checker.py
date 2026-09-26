@@ -20,6 +20,7 @@ for name in ("telethon", "telethon.network", "telethon.client", "asyncio"):
 logger = logging.getLogger(__name__)
 
 MAX_PING_MS = 5000
+MIN_PING_MS = 5
 TCP_TIMEOUT = 6
 TLS_TIMEOUT = 5
 PROBE_TIMEOUT = 3
@@ -206,6 +207,10 @@ async def _safe(coro, default):
         return default
 
 
+async def _noop() -> bool:
+    return False
+
+
 def _enrich(
     key: dict, ip: str, ping: int, geo: dict, probe_ok: bool, tls_ok: bool
 ) -> dict:
@@ -231,7 +236,7 @@ def _enrich(
 async def process_vless(raw: dict) -> dict | None:
     """
     1. Резолв
-    2. TCP (жёсткий фильтр)
+    2. TCP (жёсткий фильтр, MIN_PING_MS <= ping <= MAX_PING_MS)
     3. TLS + probe + geo — ПАРАЛЛЕЛЬНО
     """
     host = raw.get("ip")
@@ -250,7 +255,7 @@ async def process_vless(raw: dict) -> dict | None:
     ping: int | None = None
     for candidate in ips[:3]:
         p = await check_tcp(candidate, port)
-        if p is not None and p <= MAX_PING_MS:
+        if p is not None and MIN_PING_MS <= p <= MAX_PING_MS:
             ip = candidate
             ping = p
             break
@@ -258,7 +263,6 @@ async def process_vless(raw: dict) -> dict | None:
     if ip is None:
         return None
 
-    # Параллельно: TLS + probe + geo
     tls_coro = (
         check_tls(ip, port, sni)
         if security in ("reality", "tls") and sni
@@ -278,7 +282,3 @@ async def process_vless(raw: dict) -> dict | None:
         geo = {}
 
     return _enrich(raw, ip, ping, geo, probe_ok, tls_ok)
-
-
-async def _noop() -> bool:
-    return False
